@@ -4,16 +4,18 @@ import numpy as np
 import pinocchio as pin          # 机器人动力学/运动学库
 from pinocchio import casadi as cpin                  # Pinocchio 的 CasADi 符号接口（用于将运动学函数转换为优化变量）
 from pinocchio.robot_wrapper import RobotWrapper      # 机器人封装类
-from tf.transformations import quaternion_from_euler
+from scipy.spatial.transform import Rotation
 
 
 exit_flag = False
 
 class Arm_IK:
-    def __init__(self):
+    def __init__(self, urdf_path=None):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
         cur_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-        urdf_path = os.path.join(cur_path, 'piper_ros-noetic/src/piper_description/urdf/piper_description_pinocchio.urdf')
+        urdf_path = urdf_path or os.environ.get('PIPER_URDF')
+        if not urdf_path or not os.path.isfile(urdf_path):
+            raise FileNotFoundError('Set ~urdf_path or PIPER_URDF to the Piper URDF')
         # print(urdf_path) # /home/sxm/catkin_ws/src/piper_ros-noetic/src/piper_description/urdf/piper_description.urdf
     
         self.robot = pin.RobotWrapper.BuildFromURDF(urdf_path)
@@ -23,7 +25,7 @@ class Arm_IK:
         self.reduced_robot = self.robot.buildReducedRobot(list_of_joints_to_lock=self.mixed_jointsToLockIDs, reference_configuration=np.array([0] * self.robot.model.nq))
 
         # 为末端执行器定义一个新的参考系 'ee' (end-effector) 并附加到 joint6 上
-        q = quaternion_from_euler(0, 0, 0)
+        q = Rotation.from_euler('xyz', [0, 0, 0]).as_quat()
         self.reduced_robot.model.addFrame(
             pin.Frame('ee',
                       self.reduced_robot.model.getJointId('joint6'),
@@ -32,9 +34,10 @@ class Arm_IK:
 
         # 构建碰撞检测模型，并手动添加碰撞对（判定第 4~9 个连杆和第 0~2 个连杆间是否会碰撞）
         self.geom_model = pin.buildGeomFromUrdf(self.robot.model, urdf_path, pin.GeometryType.COLLISION)
-        for i in range(4, 10):
-            for j in range(0, 3):
-                self.geom_model.addCollisionPair(pin.CollisionPair(i, j))
+        for i in range(4, min(10, len(self.geom_model.geometryObjects))):
+            for j in range(min(3, len(self.geom_model.geometryObjects))):
+                if i != j:
+                    self.geom_model.addCollisionPair(pin.CollisionPair(i, j))
         self.geometry_data = pin.GeometryData(self.geom_model)
 
         # 记录关节数据的缓存数组
@@ -129,7 +132,7 @@ class Arm_IK:
             ori_err = np.linalg.norm(err_vec[3:])   # 姿态误差范数 (rad)
 
             pos_tol = 0.01    # 位置容差 1cm，按需调整
-            ori_tol = 0.15    # 姿态容差 ~2.9°，按需调整
+            ori_tol = 0.10    # 姿态容差约 5.7°，按需调整
 
             if pos_err > pos_tol or ori_err > ori_tol:
                 print(f"Target unreachable: pos_err={pos_err:.4f} m, " f"ori_err={ori_err:.4f} rad")
@@ -167,6 +170,27 @@ class Arm_IK:
             # sol_q = self.opti.debug.value(self.var_q)   # return original value
             return None, '', False
 
+    def validate_path(self, positions, rotations, gripper=0., max_joint_step=.15, cancelled=lambda: False):
+        """Check every Cartesian sample, not just the endpoint.
+
+        This checks IK, limits, selected self-collision pairs and solution jumps;
+        environmental collisions require an external full-arm planning checker.
+        """
+        previous = None
+        for pos, rot in zip(positions, rotations):
+            if cancelled():
+                return False
+            target = np.eye(4)
+            target[:3, 3], target[:3, :3] = pos, rot
+            joints, reach = self.get_ik_solution(target, gripper)
+            if not reach:
+                return False
+            joints = np.asarray(joints)
+            if previous is not None and np.max(np.abs(joints - previous)) > max_joint_step:
+                return False
+            previous = joints
+        return True
+
     def check_self_collision(self, q, gripper=np.array([0, 0])):
         pin.forwardKinematics(self.robot.model, self.robot.data, np.concatenate([q, gripper], axis=0))
         pin.updateGeometryPlacements(self.robot.model, self.robot.data, self.geom_model, self.geometry_data)
@@ -174,10 +198,10 @@ class Arm_IK:
         # print("collision:", collision)
         return collision
 
-    def get_ik_solution(self, targetT):
+    def get_ik_solution(self, targetT, gripper=0.):
         
         # 返回三元组：6 维关节角解，6 维重力补偿力矩，无碰撞返回 True（可执行），有碰撞返回 False（不可执行）
-        sol_q, tau_ff, get_result = self.ik_fun(targetT,0) # .homogeneous 是齐次变换矩阵（4×4）
+        sol_q, tau_ff, get_result = self.ik_fun(targetT, gripper) # .homogeneous 是齐次变换矩阵（4×4）
         
         if get_result:
             print("IK Solution:", sol_q)

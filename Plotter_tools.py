@@ -1,8 +1,9 @@
+import os
 import cv2
 import numpy as np
 import open3d as o3d
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use(os.environ.get('MPLBACKEND', 'TkAgg' if os.environ.get('DISPLAY') else 'Agg'))
 import matplotlib.pyplot as plt
 
 # 可视化工具：将 SAM2 掩码以半透明彩色叠加到原图上
@@ -45,6 +46,7 @@ class RealtimeTrajectoryPlotter:
     def add_actual_point(self, current_pos):
         """记录当前实时末端点"""
         self.actual_history.append(np.array(current_pos).copy())
+        self.actual_history = self.actual_history[-5000:]
 
     def _draw_frame(self, pos, rot_mat, linestyle='-', linewidth=2, alpha=1.0, prefix=''):
         """

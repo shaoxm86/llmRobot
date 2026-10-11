@@ -5,12 +5,7 @@ import torch
 from Plotter_tools import update_grasp_view
 from piper_pinocchio_mod2 import PiperIK
 
-T_EYEINHAND = np.array([
-    [0,  0.9397, 0.342, -0.07037],
-    [-1, 0,      0,      0.04228],
-    [0, -0.342,  0.9397, 0.04115],
-    [0,  0,      0,      1]
-])
+from Grasp_geometry import T_EYEINHAND, grasp_to_link6
 
 # 点云处理：深度图 → 3D 点云 → SVD 求物体主轴 → 采样标准化
 # 这是流水线中最昂贵的计算（每帧都跑的话 CPU 吃不消），
@@ -55,7 +50,9 @@ def get_point_cloud(prev_x_axis, cam_info, BGRcolorData, depthData, maskData):
 
     # -- 步骤 2: 掩码过滤 --
     # 只保留掩码有效 + 深度 < 1 米的点
-    mask = (mask > 0) & (depth < 1000)
+    if mask.shape != depth.shape or color.shape[:2] != depth.shape:
+        raise ValueError('Color, depth and mask dimensions must match')
+    mask = (mask > .5) & (depth > 0) & (depth < 1000) & np.isfinite(depth)
     cloud_masked = cloud[mask]
     color_masked = color[mask]
 
@@ -197,74 +194,8 @@ def score_grasp(all_grasps, obj_center, obj_rot):
     return scored_grasps
 
 
-def filter_score_grasp(all_grasps, obj_center, obj_rot, max_angle_deg=30.0):
-    """
-    对 GraspNet 生成的所有候选抓取进行几何条件筛选 + 综合打分排序。
-
-    三个评分维度:
-      1. GraspNet 置信度得分 (权重 40%)
-      2. 夹爪 Z 轴与物体长轴 (X 轴) 的对齐度 (权重 20%)
-         → 夹爪应尽量与物体长轴平行，这样抓取更稳定
-      3. 抓取中心到物体质心的距离 (权重 40%)
-         → 越靠近质心得分越高
-
-    硬过滤: 抓取接近方向与桌面法向量（Z 轴）夹角必须 < 30°
-
-    返回: 按综合得分降序排列的候选列表
-    """
-    vertical = np.array([0, 0, 1])  # 桌面法向量（期望抓取接近方向垂直桌面）
-    angle_threshold = np.deg2rad(max_angle_deg)  # 30度 → 弧度
-
-    # 物体坐标系 X 轴 = 长轴方向，归一化
-    obj_x_axis = obj_rot[:, 0]
-    obj_x_axis = obj_x_axis / np.linalg.norm(obj_x_axis)
-
-    filtered = []
-    for grasp in all_grasps:
-        
-        # ---- 评分 1: 垂直度 ----
-        # approach_dir: 夹爪前向方向（GraspNet 定义的 X 轴）
-        approach_dir = grasp.rotation_matrix[:, 0]
-        approach_dir = approach_dir / np.linalg.norm(approach_dir)
-        cos_angle = np.dot(approach_dir, vertical) # 越垂直，越-->1
-        
-        # ---- 评分 2: 夹爪 Z 轴与物体 X 轴对齐度 ----
-        # 适应 180° 对称，分正反方向
-        gripper_z = grasp.rotation_matrix[:, 2]
-        gripper_z = gripper_z / np.linalg.norm(gripper_z)
-        align_score_z = -np.dot(gripper_z, obj_x_axis)  # [-1,1]
-
-        # ---- 评分 3: 距离物体中心（指数衰减） ----
-        dist_to_center = np.linalg.norm(grasp.translation - obj_center)
-        dist_score = np.exp(-10.0 * dist_to_center)  # 越近越接近 1.0
-
-        # ---- 综合得分:  垂直度 + 置信度 + 对齐度 + 中心距 ----
-        w_vert, w_score, w_align, w_dist = 1, 1, 10, 10
-        composite_score = (w_vert * cos_angle) + (w_score * grasp.score) + (w_align * align_score_z) + (w_dist * dist_score)
-        '''
-        print("w_vert * cos_angle", w_vert * cos_angle)
-        print("w_score * grasp.score", w_score * grasp.score)
-        print("w_align * align_score_z", w_align * align_score_z)
-        print("w_dist * dist_score", w_dist * dist_score)
-        '''
-        filtered.append({
-            'grasp': grasp,
-            'composite_score': composite_score,
-            'align_score': gripper_z,
-            'dist': dist_to_center
-        })
-
-    # 按综合得分降序排列
-    filtered.sort(key=lambda x: x['composite_score'], reverse=True)
-    if len(filtered) == 0:
-        print("\n[Warning] No grasp predictions within vertical angle threshold.")
-    else:
-        print(f"\nFiltered {len(filtered)} grasps within ±{max_angle_deg}° of vertical.")
-
-    return filtered
-
 import time
-def generate_grasps(net, cloud_color_points, cloud, vis, arm_ik, T_end2base, visual=False, obj_center=None, obj_rot=None):
+def generate_grasps(net, cloud_color_points, cloud, vis, arm_ik, T_end2base, visual=False, obj_center=None, obj_rot=None, scene_points=None, table_z=0., clearance=.004):
     """
     基于 GraspNet 神经网络，预测机械爪该怎么抓物体。
 
@@ -272,7 +203,7 @@ def generate_grasps(net, cloud_color_points, cloud, vis, arm_ik, T_end2base, vis
       1. GraspNet 前向推理 → 生成大量候选抓取
       2. 碰撞检测 → 剔除会撞到物体/桌面的抓取 (< 1cm)
       3. NMS 去重 → 去掉重叠的冗余预测
-      4. 几何打分与排序 → filter_score_grasp
+      4. 几何打分与排序 → score_grasp
       5. 选取得分最高的抓取作为最终结果
 
     返回: best_grasp (GraspGroup, 仅含 1 个最优抓取) 或 None
@@ -287,12 +218,12 @@ def generate_grasps(net, cloud_color_points, cloud, vis, arm_ik, T_end2base, vis
     print(f"原始解码抓取数: {len(gg)}")
     # 步骤 2: 碰撞检测
     # 创建无模型碰撞检测器，检查每个抓取会不会撞到点云中的物体
-    COLLISION_THRESH = 0.005  # 碰撞阈值：机械爪离物体 < 0.5cm 算碰撞
+    COLLISION_THRESH = 0.01  # ModelFreeCollisionDetector 的占用比例阈值（非米）
     if COLLISION_THRESH > 0:
         voxel_size = 0.01  # 体素大小
-        collision_thresh = 0.01
+        collision_thresh = COLLISION_THRESH
         mfcdetector = ModelFreeCollisionDetector(
-            np.asarray(cloud.points), voxel_size=voxel_size)
+            np.asarray(cloud.points) if scene_points is None else scene_points, voxel_size=voxel_size)
         # detect() 逐一检查每个抓取姿态是否碰撞
         collision_mask = mfcdetector.detect(gg, approach_dist=0.05, collision_thresh=collision_thresh)
         # 只保留不碰撞的（collision_mask 为 False）
@@ -313,7 +244,8 @@ def generate_grasps(net, cloud_color_points, cloud, vis, arm_ik, T_end2base, vis
         return None
     
     ##################
-    vertical = np.array([0, 0, 1])  # 期望抓取接近方向（垂直桌面） np.array([0, 0, 1])
+    # Convert base-frame downward table normal to the capture camera frame.
+    vertical = (T_end2base @ T_EYEINHAND)[:3, :3].T @ np.array([0., 0., -1.])
     angle_threshold = np.deg2rad(25)  # 25 度的弧度值
     filtered = []
     for grasp in all_grasps:
@@ -325,10 +257,10 @@ def generate_grasps(net, cloud_color_points, cloud, vis, arm_ik, T_end2base, vis
         angle = np.arccos(cos_angle) # 反余弦，返回弧度值
         if angle < angle_threshold: filtered.append(grasp)
     if len(filtered) == 0:
-        print("\n[Warning] No grasp predictions within vertical angle threshold. Using all predictions.")
-        filtered = all_grasps
+        print("\n[Warning] No grasp predictions within vertical angle threshold. Rejecting unsafe approach directions.")
+        return None
     else:
-        print(f"\nFiltered {len(filtered)} grasps within ±30° of vertical out of {len(all_grasps)} total predictions.")
+        print(f"\nFiltered {len(filtered)} grasps within 25° of vertical out of {len(all_grasps)} total predictions.")
 
     # 对过滤后的抓取根据 score 排序（降序）
     filtered.sort(key=lambda g: g.score, reverse=True)
@@ -360,7 +292,7 @@ def generate_grasps(net, cloud_color_points, cloud, vis, arm_ik, T_end2base, vis
     ####################################
     
     # 步骤 4: 几何条件筛选 + 综合打分排序
-    # ranked_filterd = filter_score_grasp(filtered, obj_center, obj_rot, max_angle_deg=30.0)
+    # ranked_filterd = score_grasp(filtered, obj_center, obj_rot, max_angle_deg=30.0)
     ranked_filterd = score_grasp(filtered, obj_center, obj_rot)
     if len(ranked_filterd) == 0: return None
     print("len(ranked_filterd):", len(ranked_filterd))
@@ -368,32 +300,7 @@ def generate_grasps(net, cloud_color_points, cloud, vis, arm_ik, T_end2base, vis
     best_grasp = None   # 循环前初始化
     for item in ranked_filterd: # filtered ; ranked_filterd
     
-        # 步骤 1: 物体→相机 齐次矩阵
-        T_obj2cam = np.eye(4)
-        T_obj2cam[0:3, 0:3] = item['grasp'].rotation_matrix  # GraspNet 预测的抓取姿态  item['grasp'].rotation_matrix 
-        T_obj2cam[0:3, 3] = item['grasp'].translation        # GraspNet 预测的抓取位置  item['grasp'].translation 
-        # 物体→基座
-        T_obj2base = T_end2base @ T_EYEINHAND @ T_obj2cam
-    
-        # 步骤 2: 夹爪坐标系调整
-        R_Trans = np.eye(4)
-        grasp_z = T_obj2base[0:3,2]
-        grasp_z = grasp_z / np.linalg.norm(grasp_z)
-        if np.dot(grasp_z, [1,0,0]) > 0:
-            R_Trans[0:3, 0:3] = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]])
-        else:
-            R_Trans[0:3, 0:3] = np.array([[0, 0, 1], [0, -1, 0], [1, 0, 0]]) # 我写的
-        T_obj2base_forGripper = T_obj2base @ R_Trans
-    
-        # 步骤 3: 桌面保护
-        if T_obj2base_forGripper[2, 3] <= 0.0:
-            T_obj2base_forGripper[2, 3] = 0.004  # 低于桌面时抬升 0.4cm
-    
-        # 步骤 4: 夹爪→link6 Z 轴偏移补偿（13cm = 夹爪末端到 link6 法兰盘的距离）
-        T_gripper2link6 = np.eye(4)
-        T_gripper2link6[2, 3] = 0.13  # 【重要】夹爪到 link6 的 Z 轴方向距离
-        # 夹爪目标位姿 → link6 目标位姿
-        T_obj2base_forlink6 = T_obj2base_forGripper @ np.linalg.inv(T_gripper2link6)
+        T_obj2base_forlink6 = grasp_to_link6(item['grasp'], T_end2base, table_z, clearance)
 
         if PiperIK(arm_ik, T_obj2base_forlink6): # reach: 目标位置可达，返回 True（可执行），有碰撞返回 False
             b_grasp = item['grasp']  # item['grasp']
@@ -414,55 +321,6 @@ def generate_grasps(net, cloud_color_points, cloud, vis, arm_ik, T_end2base, vis
         print("[Warning] No IK-feasible grasp found.")
         return None
 
-    '''
-    # 步骤 5: 选取得分最高的抓取
-    for item in top_grasps: # top_grasps ranked_filterd
-
-        # 步骤 1: 物体→相机 齐次矩阵
-        T_obj2cam = np.eye(4)
-        T_obj2cam[0:3, 0:3] = item.rotation_matrix  # GraspNet 预测的抓取姿态
-        T_obj2cam[0:3, 3] = item.translation        # GraspNet 预测的抓取位置
-        # 物体→基座
-        T_obj2base = T_end2base @ T_EYEINHAND @ T_obj2cam
-    
-        # 步骤 2: 夹爪坐标系调整
-        R_Trans = np.eye(4)
-        grasp_z = T_obj2base[0:3,2]
-        grasp_z = grasp_z / np.linalg.norm(grasp_z)
-        print("np.dot(grasp_z, [1,0,0]):",np.dot(grasp_z, [1,0,0]))
-        if np.dot(grasp_z, [1,0,0]) > 0:
-            R_Trans[0:3, 0:3] = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]])
-        else:
-            R_Trans[0:3, 0:3] = np.array([[0, 0, 1], [0, -1, 0], [1, 0, 0]]) # 我写的
-        T_obj2base_forGripper = T_obj2base @ R_Trans
-    
-        # 步骤 3: 桌面保护
-        if T_obj2base_forGripper[2, 3] <= 0.0:
-            T_obj2base_forGripper[2, 3] = 0.005  # 低于桌面时抬升 0.5cm
-    
-        # 步骤 4: 夹爪→link6 Z 轴偏移补偿（13cm = 夹爪末端到 link6 法兰盘的距离）
-        T_gripper2link6 = np.eye(4)
-        T_gripper2link6[2, 3] = 0.130  # 【重要】夹爪到 link6 的 Z 轴方向距离
-        # 夹爪目标位姿 → link6 目标位姿
-        T_obj2base_forlink6 = T_obj2base_forGripper @ np.linalg.inv(T_gripper2link6)
-
-        if PiperIK(arm_ik, T_obj2base_forlink6): # reach: 目标位置可达，返回 True（可执行），有碰撞返回 False
-            b_grasp = item
-            best_grasp = GraspGroup()
-            best_grasp.add(b_grasp)
-            break
-    '''
-    '''
-    b_grasp = top_grasps[0]
-    # 创建一个新的 GraspGroup 并添加最佳抓取
-    best_grasp = GraspGroup()  # 初始化空的 GraspGroup
-    best_grasp.add(b_grasp) # 添加最佳抓取
-    print(best_grasp)
-    '''
-    # 可视化
-    if visual:
-        grippers = best_grasp.to_open3d_geometry_list()
-        
-        update_grasp_view(vis, cloud, grippers, obj_center=obj_center, obj_rot=obj_rot)
-
+    # Window ownership belongs to the caller: return the grasp, never create
+    # an untracked visualizer here. The caller uses update_grasp_view's return.
     return best_grasp

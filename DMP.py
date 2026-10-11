@@ -1,25 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-DMP_v2.py — 改进版 Dynamic Movement Primitives
+"""Point-to-point spring-damper trajectories with RK4 integration.
 
-V1 存在的问题:
-  1. [致命] dt 不匹配: 主程序 generate_trajectory 用 dt=0.01 生成 200 点(2s),
-     但 execute_cartesian_trajectory 用 dt=0.04 发送, 实际执行 200×0.04=8s,
-     轨迹被拉长 4 倍。
-  2. [核心] 位置-旋转速度曲线不同步: 位置 DMP 是临界阻尼弹簧(指数收敛,
-     前 30% 时间走完 95% 路程), 旋转用线性 SLERP(匀速), 导致"位置快旋转慢"。
-  3. [精度] Euler 积分: 小 tau 下数值不稳定, alpha=25/tau=0.5 时发散。
-  4. [冗余] n_bfs=100 声明但从未使用: 无基函数、无强制项, 实际是 PD 控制器。
-  5. [安全] 无速度限幅: 大距离+小 tau 可能生成超限速度。
-
-V2 改进:
-  1. 自适应 tau: 按起止距离动态调整运动时长, 远距慢、近距快。
-  2. progress 同步: PositionDMP 输出归一化进度数组, QuaternionDMP 用其驱动
-     SLERP, 位置和旋转速度曲线完全同步(都呈钟形)。
-  3. RK4 积分: 4 阶 Runge-Kutta 替代 Euler, 小 tau 下数值稳定。
-  4. 速度限幅: 可选最大速度约束。
-  5. 清理 n_bfs: 点到点运动不需要基函数, 直接移除避免误导。
+Positional progress is derived from the actual trajectory and normalized to the
+endpoint; quaternion SLERP uses that same progress. Rotation-only motion uses
+a quintic time law. This module does not learn demonstration trajectories.
 """
 
 import numpy as np
@@ -50,7 +35,7 @@ class PositionDMP:
         """
         self.alpha = alpha
         self.beta = beta
-        self.cs_alpha = 1.0  # 规范化系统衰减系数
+
 
     def generate_traj(self, start_pos, goal_pos, tau=None, dt=0.01,
                             tau_min=0.8, tau_max=5.0, dist_scale=3.0,
@@ -74,6 +59,15 @@ class PositionDMP:
         start_pos = np.array(start_pos, dtype=np.float64)
         goal_pos = np.array(goal_pos, dtype=np.float64)
 
+        if start_pos.shape != (3,) or goal_pos.shape != (3,):
+            raise ValueError('Positions must be 3-vectors')
+        if not np.isfinite(start_pos).all() or not np.isfinite(goal_pos).all():
+            raise ValueError('Positions must be finite')
+        if dt <= 0 or (tau is not None and tau <= 0):
+            raise ValueError('dt and tau must be positive')
+        if max_vel is not None and max_vel <= 0:
+            raise ValueError('max_vel must be positive')
+
         # ===== 自适应 tau =====
         if tau is None:
             distance = np.linalg.norm(goal_pos - start_pos)
@@ -86,9 +80,7 @@ class PositionDMP:
 
         pos_traj = []
         vel_traj = []
-        x_traj = []  # 规范化变量轨迹, 用于计算 progress
 
-        x = 1.0  # 规范化变量, 从 1 衰减到接近 0
 
         def dynamics(p, v):
             """二阶弹簧-阻尼系统: tau^2 * x'' = alpha * (beta * (g - x) - tau * x')"""
@@ -98,7 +90,7 @@ class PositionDMP:
         for _ in range(timesteps):
             pos_traj.append(pos.copy())
             vel_traj.append(vel.copy())
-            x_traj.append(x)
+
 
             # ===== RK4 积分 (比 Euler 精度高, 小 tau 下更稳定) =====
             # 状态向量: [pos, vel], 动力学: [vel, acc]
@@ -119,25 +111,25 @@ class PositionDMP:
                 if speed > max_vel:
                     vel = vel * (max_vel / speed)
 
-            # 规范化系统指数衰减
-            x += (-self.cs_alpha * x / tau) * dt
-
         pos_traj = np.array(pos_traj)
         vel_traj = np.array(vel_traj)
-        x_traj = np.array(x_traj)
-
-        # ===== 计算归一化进度 =====
-        # x 从 1 衰减到 x_final (接近 0 但不等于 0)
-        # progress = (1 - x) / (1 - x_final), 保证 [0, 1] 严格归一化
-        x_final = x_traj[-1]
-        if x_final < 1.0 - 1e-6:
-            progress = (1.0 - x_traj) / (1.0 - x_final)
+        displacement = goal_pos - start_pos
+        distance_sq = np.dot(displacement, displacement)
+        if distance_sq > 1e-16:
+            # Use actual positional progress, not an unrelated canonical decay.
+            progress = (pos_traj - start_pos) @ displacement / distance_sq
+            if progress[-1] <= 0 or np.any(np.diff(progress) < -1e-8):
+                raise ValueError('Unstable or non-monotonic trajectory')
+            scale = progress[-1]
+            progress = progress / scale
+            pos_traj = start_pos + progress[:, None] * displacement
+            vel_traj = vel_traj / scale
+            if max_vel is not None and np.max(np.linalg.norm(vel_traj, axis=1)) > max_vel * (1 + 1e-6):
+                raise ValueError('Requested duration cannot satisfy max_vel; increase tau')
         else:
-            progress = np.ones(len(x_traj))
-
-        # 兜底: 确保首尾精确为 0 和 1
-        progress[0] = 0.0
-        progress[-1] = 1.0
+            t = np.linspace(0., 1., timesteps)
+            progress = 10*t**3 - 15*t**4 + 6*t**5
+        progress[0], progress[-1] = 0., 1.
 
         return pos_traj, vel_traj, progress
 

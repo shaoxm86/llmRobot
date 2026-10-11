@@ -6,21 +6,25 @@ from ultralytics import YOLOWorld, SAM
 # 动态设置项目路径，将所需子模块目录添加到 Python 的模块搜索路径中
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # 当前脚本所在文件夹的上级目录的绝对路径
 # os.path.join()：拼接路径，.append()：将新路径添加到最后。作用：让 Python 能够导入这些目录中的自定义 .py 文件
-sys.path.append(os.path.join(ROOT_DIR, 'graspnet-baseline', 'models'))
-sys.path.append(os.path.join(ROOT_DIR, 'graspnet-baseline', 'dataset'))
-sys.path.append(os.path.join(ROOT_DIR, 'graspnet-baseline', 'utils'))
-sys.path.append(os.path.join(ROOT_DIR, 'manipulator_grasp'))
+GRASPNET_ROOT = os.environ.get('GRASPNET_BASELINE_ROOT', os.path.join(ROOT_DIR, 'graspnet-baseline'))
+for subdir in ('models', 'dataset', 'utils'):
+    sys.path.append(os.path.join(GRASPNET_ROOT, subdir))
 
 from graspnet import GraspNet, pred_decode
 
-def model_init():
+def model_init(yolo_path=None, sam_path=None, checkpoint_path=None, device=None):
 
     # YOLO-World: 开放词汇目标检测
-    yolo_world_model = '/home/sxm/catkin_ws/src/yoloworld-sam-graspnet/src/yolov8s-worldv2.pt'
-    yolo = YOLOWorld(yolo_world_model).to('cuda:0')
+    device = device or ('cuda:0' if torch.cuda.is_available() else 'cpu')
+    yolo_world_model = yolo_path or os.environ.get('YOLO_WORLD_WEIGHTS')
+    sam2_model = sam_path or os.environ.get('SAM_WEIGHTS')
+    checkpoint_path = checkpoint_path or os.environ.get('GRASPNET_CHECKPOINT')
+    for path in (yolo_world_model, sam2_model, checkpoint_path):
+        if not path or not os.path.isfile(path):
+            raise FileNotFoundError('Configure YOLO/SAM/GraspNet weight paths')
+    yolo = YOLOWorld(yolo_world_model).to(device)
     # SAM 2: 视频分割追踪（tiny 版，速度优先）
-    sam2_model = '/home/sxm/sam2/sam2.1_t.pt'
-    sam = SAM(sam2_model).to('cuda:0')
+    sam = SAM(sam2_model).to(device)
 
     # ----------------------------------------------------
     # GraspNet: 6-DOF 抓取预测网络
@@ -38,10 +42,10 @@ def model_init():
                    hmin=-0.01,
                    hmax_list=[0.02, 0.04, 0.06, 0.08], 
                    is_training=False)
-    net.to(torch.device('cuda:0' if torch.cuda.is_available() else 'cpu'))
+    net.to(torch.device(device))
 
     # 加载预训练权重
-    checkpoint = torch.load(os.path.join(ROOT_DIR, './logs/log_rs/checkpoint-rs.tar'))
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     net.load_state_dict(checkpoint['model_state_dict'])
     net.eval()  # 推理模式
 

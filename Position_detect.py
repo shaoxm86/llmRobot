@@ -2,14 +2,7 @@ import time
 import rospy
 import numpy as np
 
-# 相机光心到关节 6 末端的齐次变换矩阵（眼在手上）
-# 来源：SolidWorks 标定结果
-T_EYEINHAND = np.array([
-    [0,  0.9397, 0.342, -0.07037],
-    [-1, 0,      0,      0.04228],
-    [0, -0.342,  0.9397, 0.04115],
-    [0,  0,      0,      1]
-])
+from Grasp_geometry import T_EYEINHAND, grasp_to_link6
 
 # 带冻结机制的运动检测器
 class ObjectMotionDetector:
@@ -128,6 +121,9 @@ class ObjectMotionDetector:
                 self.filtered_aspect = (self.ema_alpha * raw_aspect +
                                         (1 - self.ema_alpha) * self.filtered_aspect)
 
+        if self.frozen:
+            return False, self.filtered_pos
+
         # ===== 步骤 3: 首次初始化 =====
         # 第一次运行，还没有参考点，强制返回 True 触发首轮完整的抓取计算
         if self.last_grasp_pos is None:
@@ -181,6 +177,18 @@ class ObjectMotionDetector:
         # ===== 步骤 8: 正常，无需重算 =====
         return False, self.filtered_pos
 
+    def update_with_distance(self, raw_pos, gripper_pos, raw_aspect=None,
+                             current_time=None, can_freeze=True):
+        """EMA always runs; distinct thresholds retain state in the hysteresis band."""
+        need, filtered = self.update(raw_pos, raw_aspect, current_time)
+        distance = np.linalg.norm(np.asarray(gripper_pos) - filtered)
+        if not self.frozen and can_freeze and distance < self.grasp_freeze_distance:
+            self.freeze()
+        elif self.frozen and distance > self.grasp_unfreeze_distance:
+            self.unfreeze()
+            need = True  # Revalidate the target after leaving the near-object zone.
+        return (False if self.frozen else need), filtered
+
     def reset(self):
         """完全重置检测器状态（轨迹取消 / 新一轮检测等场景）"""
         self.filtered_pos = None
@@ -188,6 +196,7 @@ class ObjectMotionDetector:
         self.last_grasp_pos = None
         self.last_grasp_aspect = None
         self.last_grasp_time = 0.0
+        self.frozen = False
 
 
 # 轻量级物体位置快速估计
@@ -212,7 +221,8 @@ def quick_object_pos_in_base(saved_boxes, depth_data, cam_info, T_end2base, mask
           success=False 时 position 为 None, aspect_ratio 为 0.0
           aspect_ratio = w/h, 宽高比 > 1 表示横向长条, < 1 表示纵向长条
     """
-    if saved_boxes is None or len(saved_boxes) == 0:
+    if (cam_info.fx <= 0 or cam_info.fy <= 0 or
+            saved_boxes is None or len(saved_boxes) == 0):
         return None, False, 0.0, 0.0
 
     x1, y1, x2, y2 = saved_boxes[0].astype(int)
@@ -223,10 +233,10 @@ def quick_object_pos_in_base(saved_boxes, depth_data, cam_info, T_end2base, mask
     # 优先用 mask 区域取深度（更精确），否则用 bbox 区域
     if mask is not None and mask.shape[:2] == depth_data.shape[:2]:
         # 取掩码内有效深度值（排除深度为 0 的无效点）
-        region_depth = depth_data[(mask > 0.5) & (depth_data > 0)]
+        region_depth = depth_data[(mask > 0.5) & (depth_data > 0) & np.isfinite(depth_data)]
     else:
         bbox_depth = depth_data[y1:y2, x1:x2]
-        region_depth = bbox_depth[bbox_depth > 0]
+        region_depth = bbox_depth[(bbox_depth > 0) & np.isfinite(bbox_depth)]
 
     # 有效深度点太少则放弃
     if len(region_depth) < 20:
@@ -267,51 +277,7 @@ def quick_object_pos_in_base(saved_boxes, depth_data, cam_info, T_end2base, mask
 
     return T_obj2base[:3, 3], True, median_depth_m, aspect_ratio
 
-def FunObj2base(grasp_in_cam, T_end2base):
-    """
-    将 GraspNet 预测的相机系抓取位姿转换为基座系下 link6 的目标位姿。
-
-    处理流程:
-      1. 物体系抓取 → 基座系（T_end2base × T_eyeinhand × T_obj2cam）
-      2. 夹爪坐标系调整（旋转矩阵修正：GraspNet x→夹爪 z, GraspNet z→夹爪 x）
-      3. 桌面保护（夹爪低于桌面时抬升 0.5cm）
-      4. 夹爪→link6 偏移补偿（Z 方向 13cm）
-
-    返回: (T_obj2base_forlink6, target_pos, target_rot)
-          target_pos [x,y,z] 单位 m, target_rot (3x3)
-    """
-    # 步骤 1: 物体→相机 齐次矩阵
-    T_obj2cam = np.eye(4)
-    T_obj2cam[0:3, 0:3] = grasp_in_cam.rotation_matrix  # GraspNet 预测的抓取姿态
-    T_obj2cam[0:3, 3] = grasp_in_cam.translation         # GraspNet 预测的抓取位置
-    # 物体→基座
-    T_obj2base = T_end2base @ T_EYEINHAND @ T_obj2cam
-
-    # 步骤 2: 夹爪坐标系调整
-    # GraspNet 输出的抓取坐标系与 Piper 夹爪坐标系定义不同：
-    #   GraspNet: x=接近方向, y=夹爪宽度方向, z=夹爪长度方向
-    #   Piper:    x=夹爪长度方向, y=夹爪宽度方向, z=接近方向
-    # 旋转映射: GraspNet_x → Piper_z, GraspNet_y_取反 → Piper_y, GraspNet_z → Piper_x
-    R_Trans = np.eye(4)
-    grasp_z = T_obj2base[0:3,2]
-    grasp_z = grasp_z / np.linalg.norm(grasp_z)
-    if np.dot(grasp_z, [1,0,0]) > 0:
-        R_Trans[0:3, 0:3] = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]])
-    else:
-        R_Trans[0:3, 0:3] = np.array([[0, 0, 1], [0, -1, 0], [1, 0, 0]]) # 我写的
-        
-    T_obj2base_forGripper = T_obj2base @ R_Trans
-
-    # 步骤 3: 桌面保护
-    if T_obj2base_forGripper[2, 3] <= 0.0:
-        T_obj2base_forGripper[2, 3] = 0.003  # 低于桌面时抬升 0.3cm
-
-    # 步骤 4: 夹爪→link6 Z 轴偏移补偿（13cm = 夹爪末端到 link6 法兰盘的距离）
-    T_gripper2link6 = np.eye(4)
-    T_gripper2link6[2, 3] = 0.130  # 【重要】夹爪到 link6 的 Z 轴方向距离
-    # 夹爪目标位姿 → link6 目标位姿
-    T_obj2base_forlink6 = T_obj2base_forGripper @ np.linalg.inv(T_gripper2link6)
-
-    target_pos = T_obj2base_forlink6[:3, 3]  # link6 目标位置 [x,y,z]
-    target_rot = T_obj2base_forlink6[:3, :3]  # link6 目标姿态 (3x3)
-    return T_obj2base_forlink6, target_pos, target_rot
+def FunObj2base(grasp_in_cam, T_end2base, table_z=0., clearance=.004):
+    """Camera grasp -> base-frame link6 target, shared with IK screening."""
+    pose = grasp_to_link6(grasp_in_cam, T_end2base, table_z, clearance)
+    return pose, pose[:3, 3].copy(), pose[:3, :3].copy()
