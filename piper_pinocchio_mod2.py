@@ -10,15 +10,15 @@ from scipy.spatial.transform import Rotation
 exit_flag = False
 
 class Arm_IK:
-    def __init__(self, urdf_path=None):
+    def __init__(self, urdf_path=None, verbose=False):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
-        cur_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        self.verbose = verbose
         urdf_path = urdf_path or os.environ.get('PIPER_URDF')
         if not urdf_path or not os.path.isfile(urdf_path):
             raise FileNotFoundError('Set ~urdf_path or PIPER_URDF to the Piper URDF')
         # print(urdf_path) # /home/sxm/catkin_ws/src/piper_ros-noetic/src/piper_description/urdf/piper_description.urdf
     
-        self.robot = pin.RobotWrapper.BuildFromURDF(urdf_path)
+        self.robot = RobotWrapper.BuildFromURDF(urdf_path)
         # 锁死夹爪/末端相关的关节 ("joint7", "joint8")，将 8 自由度机器人简化为 6 自由度臂
         self.mixed_jointsToLockIDs = ["joint7", "joint8"]
         # buildReducedRobot 将 joint7、joint8（夹爪两个手指关节）固定在零位并从运动学树中消除
@@ -121,7 +121,7 @@ class Arm_IK:
 
         try:
             # sol = self.opti.solve()
-            sol = self.opti.solve_limited() # solve_limited()：带最大迭代次数上限的求解，避免优化无限卡死
+            self.opti.solve_limited() # solve_limited()：带最大迭代次数上限的求解，避免优化无限卡死
             sol_q = self.opti.value(self.var_q) # 提取算出的关节角度
 
             # ========== 新增：可达性校验 ==========
@@ -204,7 +204,8 @@ class Arm_IK:
         sol_q, tau_ff, get_result = self.ik_fun(targetT, gripper) # .homogeneous 是齐次变换矩阵（4×4）
         
         if get_result:
-            print("IK Solution:", sol_q)
+            if self.verbose:
+                print("IK Solution:", sol_q)
             return sol_q, True
         else:
             return [], False

@@ -19,7 +19,7 @@ def message_stamp(msg, allow_receipt=False, receipt=None):
 def decode_image(msg, dtype, channels=1):
     dtype = np.dtype(dtype).newbyteorder('>' if msg.is_bigendian else '<')
     row_bytes = msg.width * channels * dtype.itemsize
-    if msg.step < row_bytes or len(msg.data) < msg.height * msg.step:
+    if msg.step < row_bytes or len(msg.data) != msg.height * msg.step:
         raise ValueError('Image step/data length is invalid')
     rows = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.step)
     packed = rows[:, :row_bytes].copy().reshape(-1).view(dtype)
@@ -71,7 +71,8 @@ class CameraInfoMsg:
         with self.lock:
             self.width, self.height = msg.width, msg.height
             self.fx, self.fy, self.cx, self.cy = msg.K[0], msg.K[4], msg.K[2], msg.K[5]
-            self.ready = self.fx > 0 and self.fy > 0 and self.width > 0 and self.height > 0
+            self.ready = (np.isfinite([self.fx, self.fy, self.cx, self.cy]).all() and
+                          self.fx > 0 and self.fy > 0 and self.width > 0 and self.height > 0)
 
     def snapshot(self):
         from types import SimpleNamespace

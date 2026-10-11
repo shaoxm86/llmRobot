@@ -10,7 +10,7 @@ GRASPNET_ROOT = os.environ.get('GRASPNET_BASELINE_ROOT', os.path.join(ROOT_DIR, 
 for subdir in ('models', 'dataset', 'utils'):
     sys.path.append(os.path.join(GRASPNET_ROOT, subdir))
 
-from graspnet import GraspNet, pred_decode
+from graspnet import GraspNet
 
 def model_init(yolo_path=None, sam_path=None, checkpoint_path=None, device=None):
 
@@ -23,7 +23,7 @@ def model_init(yolo_path=None, sam_path=None, checkpoint_path=None, device=None)
         if not path or not os.path.isfile(path):
             raise FileNotFoundError('Configure YOLO/SAM/GraspNet weight paths')
     yolo = YOLOWorld(yolo_world_model).to(device)
-    # SAM 2: 视频分割追踪（tiny 版，速度优先）
+    # SAM 2: 每帧使用检测框提示进行分割
     sam = SAM(sam2_model).to(device)
 
     # ----------------------------------------------------

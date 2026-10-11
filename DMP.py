@@ -236,3 +236,187 @@ def compute_adaptive_tau(start_pos, goal_pos, start_rot=None, goal_rot=None,
     tau = float(np.clip(tau, tau_min, tau_max))
 
     return tau
+
+class OnlinePoseDMP:
+    """Stateful goal-attractor DMP for online Cartesian pose execution.
+
+    Position uses tau²*x'' = alpha*(beta*(g-x) - tau*x'). Orientation
+    uses the same spring-damper law on the SO(3) logarithmic error, with
+    a unit quaternion and base-frame angular velocity as its state.
+    set_goal changes only the attractors; it never resets x, v, q or omega.
+    There is no learned forcing term in this point-to-point implementation.
+    """
+    def __init__(self, start_pose, goal_pose, alpha=15., beta=None, tau=2.,
+                 max_speed=.10, max_acceleration=.25,
+                 max_angular_speed=.5, max_angular_acceleration=1., goal_transition_time=.5):
+        self.alpha = float(alpha)
+        self.beta = self.alpha / 4 if beta is None else float(beta)
+        self.tau = float(tau)
+        self.max_speed = float(max_speed)
+        self.max_acceleration = float(max_acceleration)
+        self.max_angular_speed = float(max_angular_speed)
+        self.max_angular_acceleration = float(max_angular_acceleration)
+        self.goal_transition_time = float(goal_transition_time)
+        parameters = (self.alpha, self.beta, self.tau, self.max_speed,
+                      self.max_acceleration, self.max_angular_speed,
+                      self.max_angular_acceleration, self.goal_transition_time)
+        if not all(np.isfinite(value) and value > 0 for value in parameters):
+            raise ValueError('Online DMP gains, tau and limits must be positive and finite')
+        start_pose = self.checked_pose(start_pose)
+        self.position = start_pose[:3, 3].copy()
+        self.velocity = np.zeros(3)
+        self.orientation = R.from_matrix(start_pose[:3, :3])
+        self.angular_velocity = np.zeros(3)
+        self.set_goal(goal_pose)
+
+    @staticmethod
+    def checked_pose(pose):
+        pose = np.asarray(pose, dtype=float)
+        if pose.shape != (4, 4) or not np.isfinite(pose).all():
+            raise ValueError('Pose must be a finite 4x4 transform')
+        rotation = pose[:3, :3]
+        if (not np.allclose(pose[3], [0, 0, 0, 1]) or
+                not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6) or
+                not np.isclose(np.linalg.det(rotation), 1., atol=1e-6)):
+            raise ValueError('Pose must be a rigid transform')
+        return pose.copy()
+
+    def set_goal(self, pose):
+        pose = self.checked_pose(pose)
+        if not hasattr(self, 'goal_filter'):
+            self.goal_filter = QuinticPoseGoal(pose, self.goal_transition_time)
+        else:
+            self.goal_filter.retarget(pose)
+        filtered = self.goal_filter.sample()[0]
+        self.goal_position = filtered[:3, 3].copy()
+        self.goal_orientation = R.from_matrix(filtered[:3, :3])
+
+    @staticmethod
+    def limited(vector, bound):
+        norm = np.linalg.norm(vector)
+        return vector * min(1., bound / max(norm, 1e-15))
+
+    def pose(self):
+        pose = np.eye(4)
+        pose[:3, 3] = self.position
+        pose[:3, :3] = self.orientation.as_matrix()
+        return pose
+
+    def step(self, dt):
+        if not np.isfinite(dt) or dt <= 0:
+            raise ValueError('Integration dt must be positive and finite')
+        # Small substeps keep the damped dynamics stable for fast time scales.
+        count = max(1, int(np.ceil(dt / min(.01, self.tau / self.alpha / 4))))
+        h = dt / count
+        for _ in range(count):
+            filtered = self.goal_filter.step(h)
+            self.goal_position = filtered[:3, 3].copy()
+            self.goal_orientation = R.from_matrix(filtered[:3, :3])
+            acceleration = self.alpha * (self.beta * (self.goal_position - self.position)
+                                           - self.tau * self.velocity) / self.tau**2
+            acceleration = self.limited(acceleration, self.max_acceleration)
+            new_velocity = self.limited(self.velocity + h * acceleration, self.max_speed)
+            self.position += .5 * h * (self.velocity + new_velocity)
+            self.velocity = new_velocity
+            # Log of goal * current^-1 is the shortest rotation in the base frame.
+            error = (self.goal_orientation * self.orientation.inv()).as_rotvec()
+            angular_acceleration = self.alpha * (self.beta * error
+                              - self.tau * self.angular_velocity) / self.tau**2
+            angular_acceleration = self.limited(angular_acceleration, self.max_angular_acceleration)
+            new_angular_velocity = self.limited(self.angular_velocity + h * angular_acceleration,
+                                               self.max_angular_speed)
+            increment = .5 * h * (self.angular_velocity + new_angular_velocity)
+            self.orientation = R.from_rotvec(increment) * self.orientation
+            self.angular_velocity = new_angular_velocity
+        return self.pose()
+
+    def settled(self, pos_tol=.003, rot_tol=.03, speed_tol=.003, angular_speed_tol=.02):
+        return (self.goal_filter.finished and
+                np.linalg.norm(self.position - self.goal_position) <= pos_tol and
+                (self.goal_orientation * self.orientation.inv()).magnitude() <= rot_tol and
+                np.linalg.norm(self.velocity) <= speed_tol and
+                np.linalg.norm(self.angular_velocity) <= angular_speed_tol)
+
+
+class QuinticPoseGoal:
+    """C2 goal transition; repeated retargets inherit current derivatives.
+
+    Translation is a quintic Hermite polynomial. Rotation is a quintic in
+    the base-frame rotation-vector chart, composed onto the current rotation.
+    Angular velocity/acceleration are mapped with the SO(3) left Jacobian.
+    """
+    def __init__(self, pose, duration=.5):
+        pose = OnlinePoseDMP.checked_pose(pose)
+        if not np.isfinite(duration) or duration <= 0:
+            raise ValueError('Goal transition duration must be positive and finite')
+        self.duration = float(duration)
+        self.elapsed = self.duration
+        self.destination = pose.copy()
+        self.position_coefficients = self.coefficients(pose[:3, 3], pose[:3, 3], np.zeros(3), np.zeros(3))
+        self.rotation_coefficients = np.zeros((6, 3))
+        self.rotation_origin = R.from_matrix(pose[:3, :3])
+
+    def coefficients(self, start, finish, velocity, acceleration):
+        # Match start p/v/a and finish p, v=0, a=0 in normalized time u.
+        delta = np.asarray(finish) - start
+        v, a = velocity * self.duration, acceleration * self.duration**2
+        return np.array([start, v, .5*a, 10*delta-6*v-1.5*a,
+                         -15*delta+8*v+1.5*a, 6*delta-3*v-.5*a])
+
+    def polynomial(self, coefficients):
+        u = np.clip(self.elapsed / self.duration, 0., 1.)
+        value = sum(coefficients[i] * u**i for i in range(6))
+        velocity = sum(i*coefficients[i]*u**(i-1) for i in range(1,6)) / self.duration
+        acceleration = sum(i*(i-1)*coefficients[i]*u**(i-2) for i in range(2,6)) / self.duration**2
+        return value, velocity, acceleration
+
+    @staticmethod
+    def left_jacobian(vector):
+        x, y, z = vector
+        skew = np.array([[0., -z, y], [z, 0., -x], [-y, x, 0.]])
+        angle = np.linalg.norm(vector)
+        if angle < 1e-4:
+            a = .5 - angle**2/24 + angle**4/720
+            b = 1/6 - angle**2/120 + angle**4/5040
+        else:
+            a = (1-np.cos(angle)) / angle**2
+            b = (angle-np.sin(angle)) / angle**3
+        return np.eye(3) + a*skew + b*(skew @ skew)
+
+    def sample(self):
+        if self.finished:
+            return self.destination.copy(), np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3)
+        position, velocity, acceleration = self.polynomial(self.position_coefficients)
+        vector, vector_velocity, vector_acceleration = self.polynomial(self.rotation_coefficients)
+        jacobian = self.left_jacobian(vector)
+        epsilon = 1e-5
+        jacobian_dot = (self.left_jacobian(vector + epsilon*vector_velocity) -
+                        self.left_jacobian(vector - epsilon*vector_velocity)) / (2*epsilon)
+        angular_velocity = jacobian @ vector_velocity
+        angular_acceleration = jacobian @ vector_acceleration + jacobian_dot @ vector_velocity
+        pose = np.eye(4)
+        pose[:3, 3] = position
+        pose[:3, :3] = (R.from_rotvec(vector) * self.rotation_origin).as_matrix()
+        return pose, velocity, acceleration, angular_velocity, angular_acceleration
+
+    @property
+    def finished(self):
+        return self.elapsed >= self.duration
+
+    def retarget(self, destination):
+        destination = OnlinePoseDMP.checked_pose(destination)
+        if np.allclose(destination, self.destination, atol=1e-12, rtol=0):
+            return
+        current, velocity, acceleration, angular_velocity, angular_acceleration = self.sample()
+        self.position_coefficients = self.coefficients(current[:3, 3], destination[:3, 3], velocity, acceleration)
+        self.rotation_origin = R.from_matrix(current[:3, :3])
+        relative = (R.from_matrix(destination[:3, :3]) * self.rotation_origin.inv()).as_rotvec()
+        self.rotation_coefficients = self.coefficients(np.zeros(3), relative, angular_velocity, angular_acceleration)
+        self.destination = destination.copy()
+        self.elapsed = 0.
+
+    def step(self, dt):
+        if not np.isfinite(dt) or dt <= 0:
+            raise ValueError('Goal filter dt must be positive and finite')
+        self.elapsed = min(self.duration, self.elapsed + dt)
+        return self.sample()[0]

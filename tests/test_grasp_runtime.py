@@ -126,6 +126,23 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(executor.state, 'FAILED')
         self.assertTrue(all(width == .06 for _, width in robot.commands))
 
+    def test_offline_delayed_publish_does_not_burst_catch_up_points(self):
+        robot = FakeRobot(); executor = robot.executor()
+        times = []
+        original = robot.publish
+        def delayed_publish(command, opening):
+            times.append(robot.now)
+            original(command, opening)
+            if len(times) == 1:
+                robot.now += .05
+        executor.publish = delayed_publish
+        target = np.eye(4)
+        def planner(start, goal):
+            return np.zeros((4,3)), np.tile(np.eye(3),(4,1,1))
+        executor.move(target, .06, planner)
+        self.assertGreaterEqual(times[1] - times[0], .06 - 1e-12)
+        self.assertGreaterEqual(min(np.diff(times[1:])), .01 - 1e-12)
+
     def test_publish_exception_cleans_state(self):
         robot = FakeRobot(); executor = robot.executor()
         def failure(*args):

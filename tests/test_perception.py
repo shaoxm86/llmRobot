@@ -86,6 +86,34 @@ class PerceptionTests(unittest.TestCase):
         info.Callback(SimpleNamespace(width=2, height=2, K=[100,0,1,0,100,1,0,0,1]))
         self.assertEqual(info.snapshot().fx, 100)
 
+    def test_nonfinite_camera_intrinsics_not_ready(self):
+        info = messages.CameraInfoMsg()
+        info.Callback(SimpleNamespace(width=2, height=2, K=[float('inf'),0,1,0,100,1,0,0,1]))
+        self.assertIsNone(info.snapshot())
+
+    def test_tensor_device_override_is_used_in_cloud_builder(self):
+        tree = ast.parse((ROOT/'PointCloud_Grasp.py').read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'get_point_cloud')
+        seen = []
+        class Tensor:
+            def to(self, device):
+                seen.append(device)
+                return self
+        fake_torch = SimpleNamespace(device=lambda value: value, from_numpy=lambda value: Tensor(),
+            cuda=SimpleNamespace(is_available=lambda: True))
+        rng = np.random.default_rng(42)
+        point_cloud = rng.normal(size=(10,10,3))
+        fake_o3d = SimpleNamespace(geometry=SimpleNamespace(PointCloud=lambda: SimpleNamespace()),
+                                  utility=SimpleNamespace(Vector3dVector=lambda value: value))
+        ns = {'np': np, 'torch': fake_torch, 'o3d': fake_o3d,
+              'Camera_Info': lambda *a: None,
+              'create_point_cloud_from_depth_image': lambda *a, **kw: point_cloud}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), 'PointCloud_Grasp.py', 'exec'), ns)
+        info = SimpleNamespace(width=10, height=10, fx=100., fy=100., cx=5., cy=5.)
+        result = ns['get_point_cloud'](None, info, np.zeros((10,10,3)), np.full((10,10),500), np.ones((10,10)), device='cpu')
+        self.assertIsNotNone(result[1])
+        self.assertEqual(seen, ['cpu'])
+
     def test_unstamped_pose_requires_explicit_fallback(self):
         msg = SimpleNamespace(x=0., y=0., z=.2, roll=0., pitch=0., yaw=0.)
         end = messages.End2base(); end.Callback(msg)

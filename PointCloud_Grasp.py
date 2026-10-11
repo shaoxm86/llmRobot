@@ -2,7 +2,6 @@ from data_utils import CameraInfo as Camera_Info, create_point_cloud_from_depth_
 import numpy as np
 import open3d as o3d
 import torch
-from Plotter_tools import update_grasp_view
 from piper_pinocchio_mod2 import PiperIK
 
 from Grasp_geometry import T_EYEINHAND, grasp_to_link6
@@ -11,7 +10,7 @@ from Grasp_geometry import T_EYEINHAND, grasp_to_link6
 # 这是流水线中最昂贵的计算（每帧都跑的话 CPU 吃不消），
 # 记录上一帧 SVD 的 X 轴方向，用于相邻帧间避免 SVD 随机 180° 翻转
 
-def get_point_cloud(prev_x_axis, cam_info, BGRcolorData, depthData, maskData):
+def get_point_cloud(prev_x_axis, cam_info, BGRcolorData, depthData, maskData, device=None):
     """
     根据 RGB 图、深度图、分割掩码，生成 GraspNet 输入与 Open3D 可视化点云。
 
@@ -125,7 +124,7 @@ def get_point_cloud(prev_x_axis, cam_info, BGRcolorData, depthData, maskData):
     cloud_o3d.colors = o3d.utility.Vector3dVector(color_points.astype(np.float32))
 
     # GraspNet 输入（GPU 张量）
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device if device is not None else ("cuda:0" if torch.cuda.is_available() else "cpu"))
     
     # 【修改】保证内存连续性
     cloud_sampled_cont = np.ascontiguousarray(cloud_sampled[np.newaxis].astype(np.float32))
@@ -139,7 +138,7 @@ def get_point_cloud(prev_x_axis, cam_info, BGRcolorData, depthData, maskData):
 
 # -------------------------------------------------------------------------------
 from graspnetAPI import GraspGroup
-from graspnet import GraspNet, pred_decode
+from graspnet import pred_decode
 from collision_detector import ModelFreeCollisionDetector
 
 def score_grasp(all_grasps, obj_center, obj_rot):
@@ -265,34 +264,7 @@ def generate_grasps(net, cloud_color_points, cloud, vis, arm_ik, T_end2base, vis
     # 对过滤后的抓取根据 score 排序（降序）
     filtered.sort(key=lambda g: g.score, reverse=True)
 
-    ####################################
-    
-    #grippers = [g.to_open3d_geometry() for g in top_grasps]
-    grippers = []
-    for i, g in enumerate(filtered):
-        gripper_geom = g.to_open3d_geometry()
-        # Top 1 染成红色，其他保持原色
-        if i == 0:
-            gripper_geom.paint_uniform_color([1, 0, 0])
-        else:
-            gripper_geom.paint_uniform_color([0.7, 0.7, 0.7])
-        grippers.append(gripper_geom)
-
-        # Top 1 的坐标轴画大一点(5cm)，其他小一点(2cm)
-        size = 0.05 if i == 0 else 0.02
-        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size)
-        T_grasp = np.eye(4)
-        T_grasp[:3, :3] = g.rotation_matrix
-        T_grasp[:3, 3] = g.translation
-        frame.transform(T_grasp)
-        grippers.append(frame)
-
-    # o3d.visualization.draw_geometries([cloud, *grippers])
-    
-    ####################################
-    
-    # 步骤 4: 几何条件筛选 + 综合打分排序
-    # ranked_filterd = score_grasp(filtered, obj_center, obj_rot, max_angle_deg=30.0)
+    # Score without allocating unused Open3D meshes for every candidate.
     ranked_filterd = score_grasp(filtered, obj_center, obj_rot)
     if len(ranked_filterd) == 0: return None
     print("len(ranked_filterd):", len(ranked_filterd))
